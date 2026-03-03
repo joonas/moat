@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"os/exec"
 	"strings"
 
@@ -16,7 +17,10 @@ type CommandContainerChecker struct {
 }
 
 // IsContainerRunning checks if a container is still running.
-func (c *CommandContainerChecker) IsContainerRunning(ctx context.Context, id string) bool {
+// Returns (true, nil) when the container is confirmed alive,
+// (false, nil) when confirmed dead, and (false, err) when the
+// check itself failed (e.g. transient CLI error).
+func (c *CommandContainerChecker) IsContainerRunning(ctx context.Context, id string) (bool, error) {
 	// Try cached runtime first.
 	switch c.runtime {
 	case "docker":
@@ -26,41 +30,52 @@ func (c *CommandContainerChecker) IsContainerRunning(ctx context.Context, id str
 	}
 
 	// No cached runtime — try Docker first (most common).
-	if c.checkDocker(ctx, id) {
+	alive, err := c.checkDocker(ctx, id)
+	if alive {
 		c.runtime = "docker"
-		return true
+		return true, nil
+	}
+	if err == nil {
+		// Docker confirmed container is not running (found it, State.Running=false).
+		return false, nil
 	}
 
-	// Try Apple containers.
-	if c.checkApple(ctx, id) {
+	// Docker failed with an error — try Apple containers.
+	alive, appleErr := c.checkApple(ctx, id)
+	if alive {
 		c.runtime = "apple"
-		return true
+		return true, nil
+	}
+	if appleErr == nil {
+		// Apple confirmed container is not running.
+		return false, nil
 	}
 
-	return false
+	// Both checks failed; prefer the Docker error as primary.
+	return false, err
 }
 
 // checkDocker checks if a Docker container is running.
-func (c *CommandContainerChecker) checkDocker(ctx context.Context, id string) bool {
+func (c *CommandContainerChecker) checkDocker(ctx context.Context, id string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "docker", "inspect", "--format", "{{.State.Running}}", id)
 	out, err := cmd.Output()
 	if err != nil {
-		return false
+		return false, fmt.Errorf("docker inspect: %w", err)
 	}
-	return strings.TrimSpace(string(out)) == "true"
+	return strings.TrimSpace(string(out)) == "true", nil
 }
 
 // checkApple checks if an Apple container is running.
-func (c *CommandContainerChecker) checkApple(ctx context.Context, id string) bool {
+func (c *CommandContainerChecker) checkApple(ctx context.Context, id string) (bool, error) {
 	cmd := exec.CommandContext(ctx, "container", "inspect", id)
 	out, err := cmd.Output()
 	if err != nil {
-		return false
+		return false, fmt.Errorf("container inspect: %w", err)
 	}
 	// Apple container inspect returns JSON; a non-empty response with
 	// "running" state indicates the container is alive.
 	output := string(out)
-	return strings.Contains(output, `"running"`) || strings.Contains(output, `"Running"`)
+	return strings.Contains(output, `"running"`) || strings.Contains(output, `"Running"`), nil
 }
 
 // NewCommandContainerChecker creates a new container checker that uses CLI commands.
