@@ -88,6 +88,13 @@ type DepSpec struct {
 	// For service type
 	Service *ServiceDef `yaml:"service,omitempty"`
 
+	// Env specifies environment variables to set after installing this dependency.
+	// These are emitted as Dockerfile ENV instructions, making them available
+	// to all subsequent build steps and at runtime.
+	//
+	// Note: currently only honored for github-binary type dependencies.
+	Env map[string]string `yaml:"env,omitempty"`
+
 	// UserInstall indicates the dependency should be installed as the container
 	// user (moatuser) instead of root. This is needed for tools whose installers
 	// write to $HOME (e.g., claude-code's native installer).
