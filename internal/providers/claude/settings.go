@@ -56,6 +56,10 @@ type MarketplaceSource struct {
 	// URL is the git URL (for source: git or github)
 	URL string `json:"url,omitempty"`
 
+	// Repo is the GitHub owner/repo shorthand (for source: github)
+	// Claude Code's native settings.json uses this format.
+	Repo string `json:"repo,omitempty"`
+
 	// Path is the local directory path (for source: directory)
 	Path string `json:"path,omitempty"`
 }
@@ -74,6 +78,28 @@ func LoadSettings(path string) (*Settings, error) {
 	var settings Settings
 	if err := json.Unmarshal(data, &settings); err != nil {
 		return nil, err
+	}
+
+	// Normalize GitHub "repo" format to git URLs.
+	// Claude Code's native settings.json uses {"source": "github", "repo": "owner/repo"}
+	// but the rest of moat expects {"source": "git", "url": "https://..."}.
+	// Claude Code accepts both formats, so the normalized output is safe to write back.
+	for name, entry := range settings.ExtraKnownMarketplaces {
+		if entry.Source.Source == "github" && entry.Source.URL == "" {
+			if entry.Source.Repo == "" {
+				log.Debug("removing marketplace with empty repo and url from settings", "name", name)
+				delete(settings.ExtraKnownMarketplaces, name)
+			} else if validRepoFormat.MatchString(entry.Source.Repo) {
+				entry.Source.URL = "https://github.com/" + entry.Source.Repo + ".git"
+				entry.Source.Source = "git"
+				entry.Source.Repo = ""
+				settings.ExtraKnownMarketplaces[name] = entry
+			} else {
+				log.Debug("removing marketplace with invalid repo format from settings",
+					"name", name, "repo", entry.Source.Repo)
+				delete(settings.ExtraKnownMarketplaces, name)
+			}
+		}
 	}
 
 	return &settings, nil
