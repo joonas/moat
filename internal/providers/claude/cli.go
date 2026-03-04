@@ -106,9 +106,9 @@ func runClaudeCode(cmd *cobra.Command, args []string) error {
 		PromptFlag:            claudePromptFlag,
 		AllowedHosts:          claudeAllowedHosts,
 		WtFlag:                claudeWtFlag,
-		GetCredentialGrant:    getClaudeCredentialName,
-		Dependencies:          []string{"node@20", "git", "claude-code"},
-		NetworkHosts:          []string{"claude.ai", "*.claude.ai"},
+		GetCredentialGrant:    GetCredentialName,
+		Dependencies:          DefaultDependencies(),
+		NetworkHosts:          NetworkHosts(),
 		SupportsInitialPrompt: true,
 		DryRunNote:            "Note: No API key configured. Claude will prompt for login.",
 		BuildCommand: func(promptFlag, initialPrompt string) ([]string, error) {
@@ -143,7 +143,24 @@ func runClaudeCode(cmd *cobra.Command, args []string) error {
 	})
 }
 
-// getClaudeCredentialName returns the grant name to use for moat claude.
+// DefaultDependencies returns the default dependencies for running Claude Code.
+func DefaultDependencies() []string {
+	return []string{
+		"node@20",
+		"git",
+		"claude-code",
+	}
+}
+
+// NetworkHosts returns the list of hosts that Claude Code needs network access to.
+func NetworkHosts() []string {
+	return []string{
+		"claude.ai",
+		"*.claude.ai",
+	}
+}
+
+// GetCredentialName returns the grant name to use for moat claude.
 //
 // Preference order:
 //  1. claude (OAuth token) — preferred for Claude Code
@@ -154,7 +171,7 @@ func runClaudeCode(cmd *cobra.Command, args []string) error {
 //   - anthropic.enc with OAuth token → claude.enc
 //
 // Returns empty string if no credential exists.
-func getClaudeCredentialName() string {
+func GetCredentialName() string {
 	key, err := credential.DefaultEncryptionKey()
 	if err != nil {
 		return ""

@@ -37,6 +37,7 @@ import (
 	"github.com/majorcontext/moat/internal/providers/claude" // only for settings types (LoadAllSettings, Settings, MarketplaceConfig) - provider setup uses provider interfaces
 	"github.com/majorcontext/moat/internal/proxy"
 	"github.com/majorcontext/moat/internal/routing"
+	"github.com/majorcontext/moat/internal/runctx"
 	"github.com/majorcontext/moat/internal/secrets"
 	"github.com/majorcontext/moat/internal/snapshot"
 	"github.com/majorcontext/moat/internal/sshagent"
@@ -1476,6 +1477,13 @@ region = %s
 		}
 	}
 
+	// Build and render runtime context for agent instruction files.
+	var renderedContext string
+	if opts.Config != nil {
+		rc := runctx.BuildFromConfig(opts.Config, r.ID)
+		renderedContext = runctx.Render(rc)
+	}
+
 	// Set up Claude staging directory for init script using the provider interface.
 	// This includes OAuth credentials, host files, and MCP server configuration.
 	var claudeConfig *provider.ContainerConfig
@@ -1537,9 +1545,10 @@ region = %s
 			// Call provider to prepare container config
 			var prepErr error
 			claudeConfig, prepErr = claudeProvider.PrepareContainer(ctx, provider.PrepareOpts{
-				Credential:    claudeCred,
-				ContainerHome: containerHome,
-				MCPServers:    mcpServers,
+				Credential:     claudeCred,
+				ContainerHome:  containerHome,
+				MCPServers:     mcpServers,
+				RuntimeContext: renderedContext,
 				// HostConfig is read automatically by the provider if nil
 			})
 			if prepErr != nil {
@@ -1600,8 +1609,9 @@ region = %s
 		// Call provider to prepare container config
 		var prepErr error
 		codexConfig, prepErr = codexProvider.PrepareContainer(ctx, provider.PrepareOpts{
-			Credential:    codexCred,
-			ContainerHome: containerHome,
+			Credential:     codexCred,
+			ContainerHome:  containerHome,
+			RuntimeContext: renderedContext,
 		})
 		if prepErr != nil {
 			cleanupDaemonRun()
@@ -1643,8 +1653,9 @@ region = %s
 		// Call provider to prepare container config
 		var prepErr error
 		geminiConfig, prepErr = geminiProvider.PrepareContainer(ctx, provider.PrepareOpts{
-			Credential:    geminiCred,
-			ContainerHome: containerHome,
+			Credential:     geminiCred,
+			ContainerHome:  containerHome,
+			RuntimeContext: renderedContext,
 		})
 		if prepErr != nil {
 			cleanupDaemonRun()

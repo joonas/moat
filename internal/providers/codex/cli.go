@@ -107,7 +107,7 @@ func runCodex(cmd *cobra.Command, args []string) error {
 		PromptFlag:            codexPromptFlag,
 		AllowedHosts:          codexAllowedHosts,
 		WtFlag:                codexWtFlag,
-		GetCredentialGrant:    getCodexCredentialName,
+		GetCredentialGrant:    GetCredentialName,
 		Dependencies:          DefaultDependencies(),
 		NetworkHosts:          NetworkHosts(),
 		SupportsInitialPrompt: true,
@@ -137,9 +137,9 @@ func runCodex(cmd *cobra.Command, args []string) error {
 	})
 }
 
-// getCodexCredentialName returns the name under which the Codex credential is stored.
+// GetCredentialName returns the name under which the Codex credential is stored.
 // Returns empty string if no credential exists.
-func getCodexCredentialName() string {
+func GetCredentialName() string {
 	// Check both provider names (codex is the internal name, openai is legacy)
 	for _, name := range []string{"codex", "openai"} {
 		key, err := credential.DefaultEncryptionKey()
