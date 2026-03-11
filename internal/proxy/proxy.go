@@ -45,6 +45,7 @@ import (
 	"github.com/majorcontext/moat/internal/config"
 	"github.com/majorcontext/moat/internal/credential"
 	"github.com/majorcontext/moat/internal/log"
+	"github.com/majorcontext/moat/internal/netrules"
 )
 
 // contextKey is the type for request-scoped context values.
@@ -238,6 +239,7 @@ type RunContextData struct {
 	MCPServers           []config.MCPServerConfig
 	Policy               string
 	AllowedHosts         []hostPattern
+	HostRules            []netrules.HostRules
 	AWSHandler           http.Handler
 	CredStore            credential.Store
 }
@@ -270,12 +272,13 @@ type Proxy struct {
 	extraHeaders         map[string][]extraHeader                    // host -> additional headers to inject
 	responseTransformers map[string][]credential.ResponseTransformer // host -> response transformers
 	mu                   sync.RWMutex
-	ca                   *CA           // Optional CA for TLS interception
-	logger               RequestLogger // Optional request logger
-	authToken            string        // Optional auth token required for proxy access
-	policy               string        // "permissive" or "strict"
-	allowedHosts         []hostPattern // parsed allow patterns for strict policy
-	awsHandler           http.Handler  // Optional handler for AWS credential endpoint
+	ca                   *CA                  // Optional CA for TLS interception
+	logger               RequestLogger        // Optional request logger
+	authToken            string               // Optional auth token required for proxy access
+	policy               string               // "permissive" or "strict"
+	allowedHosts         []hostPattern        // parsed allow patterns for strict policy
+	hostRules            []netrules.HostRules // per-host request rules
+	awsHandler           http.Handler         // Optional handler for AWS credential endpoint
 	credStore            credential.Store
 	mcpServers           []config.MCPServerConfig
 	removeHeaders        map[string][]string           // host -> []headerName
@@ -508,6 +511,7 @@ func (p *Proxy) SetNetworkPolicy(policy string, allows []string, grants []string
 
 	p.policy = policy
 	p.allowedHosts = nil
+	p.hostRules = nil
 
 	// Parse explicit allow patterns
 	for _, pattern := range allows {
@@ -518,6 +522,28 @@ func (p *Proxy) SetNetworkPolicy(policy string, allows []string, grants []string
 	for _, grant := range grants {
 		grantHosts := GetHostsForGrant(grant)
 		for _, pattern := range grantHosts {
+			p.allowedHosts = append(p.allowedHosts, parseHostPattern(pattern))
+		}
+	}
+}
+
+// SetNetworkPolicyWithRules sets the network policy with per-host request rules.
+func (p *Proxy) SetNetworkPolicyWithRules(policy string, allows []string, grants []string, rules []netrules.HostRules) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.policy = policy
+	p.allowedHosts = nil
+	p.hostRules = rules
+
+	for _, hr := range rules {
+		p.allowedHosts = append(p.allowedHosts, parseHostPattern(hr.Host))
+	}
+	for _, pattern := range allows {
+		p.allowedHosts = append(p.allowedHosts, parseHostPattern(pattern))
+	}
+	for _, grant := range grants {
+		for _, pattern := range GetHostsForGrant(grant) {
 			p.allowedHosts = append(p.allowedHosts, parseHostPattern(pattern))
 		}
 	}
@@ -685,16 +711,55 @@ func (p *Proxy) getResponseTransformersForRequest(r *http.Request, host string) 
 	return p.getResponseTransformers(host)
 }
 
+// hostMatchAdapter creates a netrules.HostMatcher from a host pattern string.
+func hostMatchAdapter(pattern, host string, port int) bool {
+	hp := parseHostPattern(pattern)
+	return matchesPattern(hp, host, port)
+}
+
 // checkNetworkPolicyForRequest checks network policy using RunContextData first,
 // then falling back to the proxy's own policy.
-func (p *Proxy) checkNetworkPolicyForRequest(r *http.Request, host string, port int) bool {
+//
+// For CONNECT requests, only host-level checking is performed. Per-path rules
+// are enforced on the inner HTTP requests after TLS interception.
+func (p *Proxy) checkNetworkPolicyForRequest(r *http.Request, host string, port int, method, path string) bool {
 	if rc := getRunContext(r); rc != nil {
+		if method != "CONNECT" && len(rc.HostRules) > 0 {
+			return netrules.Check(rc.Policy, rc.HostRules, host, port, method, path, hostMatchAdapter)
+		}
 		if rc.Policy != "strict" {
 			return true
 		}
 		return matchHost(rc.AllowedHosts, host, port)
 	}
+
+	p.mu.RLock()
+	rules := p.hostRules
+	policy := p.policy
+	p.mu.RUnlock()
+
+	if method != "CONNECT" && len(rules) > 0 {
+		return netrules.Check(policy, rules, host, port, method, path, hostMatchAdapter)
+	}
 	return p.checkNetworkPolicy(host, port)
+}
+
+// hasPathRulesForHost returns true if any matching host entry has per-path rules.
+func (p *Proxy) hasPathRulesForHost(r *http.Request, host string, port int) bool {
+	var rules []netrules.HostRules
+	if rc := getRunContext(r); rc != nil {
+		rules = rc.HostRules
+	} else {
+		p.mu.RLock()
+		rules = p.hostRules
+		p.mu.RUnlock()
+	}
+	for _, hr := range rules {
+		if hostMatchAdapter(hr.Host, host, port) && len(hr.Rules) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 // getMCPServersForRequest returns MCP servers from RunContextData or falls
@@ -928,11 +993,11 @@ func (p *Proxy) checkNetworkPolicy(host string, port int) bool {
 
 // writeBlockedResponse writes a 407 response when a request is blocked by network policy.
 func (p *Proxy) writeBlockedResponse(w http.ResponseWriter, host string) {
-	w.Header().Set("X-Moat-Blocked", "network-policy")
+	w.Header().Set("X-Moat-Blocked", "request-rule")
 	w.Header().Set("Proxy-Authenticate", "Moat-Policy")
 	w.Header().Set("Content-Type", "text/plain")
 	w.WriteHeader(http.StatusProxyAuthRequired)
-	_, _ = w.Write([]byte("Moat: request blocked by network policy.\nHost \"" + host + "\" is not in the allow list.\nAdd it to network.allow in moat.yaml or use policy: permissive.\n"))
+	_, _ = w.Write([]byte("Moat: request blocked by network policy.\nHost \"" + host + "\" is not in the allow list.\nAdd it to network.rules in moat.yaml or use policy: permissive.\n"))
 }
 
 func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
@@ -961,7 +1026,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check network policy
-	if !p.checkNetworkPolicyForRequest(r, host, port) {
+	if !p.checkNetworkPolicyForRequest(r, host, port, r.Method, r.URL.Path) {
 		duration := time.Since(start)
 		// Log blocked request
 		p.logRequest(r, r.Method, r.URL.String(), http.StatusProxyAuthRequired, duration, nil, originalReqHeaders, nil, reqBody, nil, false, "")
@@ -1064,7 +1129,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Check network policy before establishing tunnel
-	if !p.checkNetworkPolicyForRequest(r, host, port) {
+	if !p.checkNetworkPolicyForRequest(r, host, port, "CONNECT", "") {
 		// Log blocked request
 		if p.logger != nil {
 			p.logRequest(r, r.Method, r.Host, http.StatusProxyAuthRequired, 0, nil, nil, nil, nil, nil, false, "")
@@ -1086,6 +1151,14 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		p.handleConnectWithInterception(w, r, host)
 		return
 	}
+
+	// Without TLS interception, per-path rules cannot be enforced on HTTPS
+	// traffic — only host-level allow/deny applies. Warn if rules exist.
+	if p.hasPathRulesForHost(r, host, port) {
+		log.Warn("per-path rules configured but TLS interception disabled; only host-level rules apply",
+			"subsystem", "proxy", "host", host)
+	}
+
 	p.handleConnectTunnel(w, r)
 }
 
@@ -1176,6 +1249,15 @@ func (p *Proxy) handleConnectWithInterception(w http.ResponseWriter, r *http.Req
 		// HTTP/2 on the upstream side causes framing mismatches and hangs.
 	}
 
+	// Extract port from the CONNECT request for rule checking.
+	// Defaults to 443 since this is a TLS-intercepted connection.
+	connectPort := 443
+	if _, pStr, err := net.SplitHostPort(r.Host); err == nil {
+		if p, err := net.LookupPort("tcp", pStr); err == nil {
+			connectPort = p
+		}
+	}
+
 	clientReader := bufio.NewReader(tlsClientConn)
 	for {
 		req, err := http.ReadRequest(clientReader)
@@ -1195,6 +1277,25 @@ func (p *Proxy) handleConnectWithInterception(w http.ResponseWriter, r *http.Req
 		req.URL.Scheme = "https"
 		req.URL.Host = r.Host
 		req.RequestURI = ""
+
+		// Check request-level rules (method + path) for the inner HTTP request.
+		// The CONNECT request r carries the per-run context for rule lookup.
+		if !p.checkNetworkPolicyForRequest(r, host, connectPort, req.Method, req.URL.Path) {
+			p.logRequest(r, req.Method, req.URL.String(), http.StatusProxyAuthRequired, 0, nil, nil, nil, nil, nil, false, "")
+			body := "Moat: request blocked by network policy.\nHost: " + host + "\nTo allow this request, update network.rules in moat.yaml.\n"
+			blockedResp := &http.Response{
+				StatusCode:    http.StatusProxyAuthRequired,
+				ProtoMajor:    1,
+				ProtoMinor:    1,
+				Header:        make(http.Header),
+				ContentLength: int64(len(body)),
+				Body:          io.NopCloser(strings.NewReader(body)),
+			}
+			blockedResp.Header.Set("X-Moat-Blocked", "request-rule")
+			blockedResp.Header.Set("Content-Type", "text/plain")
+			_ = blockedResp.Write(tlsClientConn)
+			continue
+		}
 
 		// Inject MCP credentials if this is an MCP request.
 		// Use the CONNECT request r for context lookups since inner
