@@ -203,6 +203,11 @@ type ServiceManager interface {
 	CheckReady(ctx context.Context, info ServiceInfo) error
 	StopService(ctx context.Context, info ServiceInfo) error
 	SetNetworkID(id string)
+
+	// ProvisionService executes commands sequentially inside the service container.
+	// Each command is run via sh -c. stdout receives streaming output for user feedback.
+	// Returns on first command failure (fail-fast).
+	ProvisionService(ctx context.Context, info ServiceInfo, cmds []string, stdout io.Writer) error
 }
 
 // ServiceConfig defines what service to provision.
@@ -218,6 +223,17 @@ type ServiceConfig struct {
 	PasswordEnv  string         // Env var containing the password (e.g., "POSTGRES_PASSWORD")
 	ExtraCmd     []string       // Extra command args with {placeholder} substitution
 	ReadinessCmd string         // Command to check if service is ready
+
+	// CachePath is the container-side path for cache mounting (e.g., "/root/.ollama").
+	CachePath string
+	// CacheHostPath is the resolved host-side path (e.g., "~/.moat/cache/ollama/").
+	CacheHostPath string
+	// Provisions is the list of items to provision (e.g., model names).
+	Provisions []string
+	// ProvisionCmd is the command template with {item} placeholder.
+	ProvisionCmd string
+	// MemoryMB is the memory limit for the service container in megabytes (0 = runtime default).
+	MemoryMB int
 }
 
 // ServiceInfo contains connection details for a started service.
@@ -323,6 +339,9 @@ type SidecarConfig struct {
 
 	// Labels are container labels (merged with defaults)
 	Labels map[string]string
+
+	// MemoryMB is the memory limit for the container in megabytes (0 = no limit).
+	MemoryMB int
 }
 
 // MountConfig describes a volume mount (bind mount from host to container).

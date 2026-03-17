@@ -143,3 +143,228 @@ func TestBuildServiceConfigUnknown(t *testing.T) {
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "unknown service")
 }
+
+func TestBuildServiceConfigOllama(t *testing.T) {
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	userSpec := &config.ServiceSpec{
+		Extra: map[string][]string{
+			"models": {"qwen2.5-coder:7b", "nomic-embed-text"},
+		},
+	}
+
+	cfg, err := buildServiceConfig(dep, "run-ollama", userSpec)
+	require.NoError(t, err)
+
+	assert.Equal(t, "ollama", cfg.Name)
+	assert.Equal(t, "0.18.1", cfg.Version)
+	assert.Equal(t, "ollama/ollama", cfg.Image)
+	assert.Equal(t, 11434, cfg.Ports["default"])
+	assert.Equal(t, "/root/.ollama", cfg.CachePath)
+	assert.Equal(t, "ollama pull {item}", cfg.ProvisionCmd)
+	assert.Equal(t, []string{"qwen2.5-coder:7b", "nomic-embed-text"}, cfg.Provisions)
+
+	// Ollama has no auth — no password should be set
+	assert.Empty(t, cfg.Env)
+	assert.Empty(t, cfg.PasswordEnv)
+}
+
+func TestBuildServiceConfigOllamaNoModels(t *testing.T) {
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	cfg, err := buildServiceConfig(dep, "run-ollama", nil)
+	require.NoError(t, err)
+
+	assert.Empty(t, cfg.Provisions)
+	assert.Equal(t, "ollama pull {item}", cfg.ProvisionCmd)
+}
+
+func TestBuildServiceConfigMemory(t *testing.T) {
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	cfg, err := buildServiceConfig(dep, "run-test", &config.ServiceSpec{Memory: 2048})
+	require.NoError(t, err)
+	assert.Equal(t, 2048, cfg.MemoryMB)
+}
+
+func TestBuildServiceConfigMemoryDefault(t *testing.T) {
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	cfg, err := buildServiceConfig(dep, "run-test", nil)
+	require.NoError(t, err)
+	assert.Equal(t, 0, cfg.MemoryMB, "zero means runtime default")
+}
+
+func TestBuildServiceConfigNoPasswordForNoAuth(t *testing.T) {
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	cfg, err := buildServiceConfig(dep, "run-test", nil)
+	require.NoError(t, err)
+
+	_, hasPassword := cfg.Env["password"]
+	assert.False(t, hasPassword, "should not set phantom password for no-auth services")
+}
+
+func TestBuildServiceConfigPostgresStillHasPassword(t *testing.T) {
+	dep := deps.Dependency{Name: "postgres", Version: "17", Type: deps.TypeService}
+
+	cfg, err := buildServiceConfig(dep, "run-pg", nil)
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, cfg.Env["POSTGRES_PASSWORD"], "postgres should still get a password")
+}
+
+func TestBuildServiceConfigValidatesProvisionsKey(t *testing.T) {
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	userSpec := &config.ServiceSpec{
+		Extra: map[string][]string{
+			"model": {"qwen2.5-coder:7b"},
+		},
+	}
+
+	_, err := buildServiceConfig(dep, "run-ollama", userSpec)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "model")
+}
+
+func TestBuildServiceConfigRejectsScalarProvisions(t *testing.T) {
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	userSpec := &config.ServiceSpec{
+		Extra: map[string][]string{
+			"models": nil, // scalar value captured as nil by UnmarshalYAML
+		},
+	}
+
+	_, err := buildServiceConfig(dep, "run-ollama", userSpec)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must be a list")
+}
+
+func TestBuildServiceConfigRejectsExtraKeysOnNonProvisionService(t *testing.T) {
+	dep := deps.Dependency{Name: "postgres", Version: "17", Type: deps.TypeService}
+
+	userSpec := &config.ServiceSpec{
+		Extra: map[string][]string{
+			"plugins": {"pg_trgm"},
+		},
+	}
+
+	_, err := buildServiceConfig(dep, "run-pg", userSpec)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "plugins")
+	assert.Contains(t, err.Error(), "not a valid")
+}
+
+func TestBuildServiceConfigRejectsShellInjection(t *testing.T) {
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	tests := []struct {
+		name  string
+		model string
+	}{
+		{"semicolon", "foo; rm -rf /"},
+		{"pipe", "foo | cat /etc/passwd"},
+		{"dollar", "foo$(whoami)"},
+		{"backtick", "foo`whoami`"},
+		{"ampersand", "foo && echo pwned"},
+		{"empty", ""},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			userSpec := &config.ServiceSpec{
+				Extra: map[string][]string{
+					"models": {tt.model},
+				},
+			}
+			_, err := buildServiceConfig(dep, "run-test", userSpec)
+			require.Error(t, err)
+			assert.Contains(t, err.Error(), "disallowed characters")
+		})
+	}
+}
+
+func TestBuildServiceConfigAcceptsValidModelNames(t *testing.T) {
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	validModels := []string{
+		"qwen2.5-coder:7b",
+		"nomic-embed-text",
+		"llama3.1:70b",
+		"library/model:latest",
+		"user/repo:v1.2.3",
+	}
+
+	userSpec := &config.ServiceSpec{
+		Extra: map[string][]string{
+			"models": validModels,
+		},
+	}
+
+	cfg, err := buildServiceConfig(dep, "run-test", userSpec)
+	require.NoError(t, err)
+	assert.Equal(t, validModels, cfg.Provisions)
+}
+
+func TestBuildServiceConfigOllamaProvisionsIncompatibleWithWaitFalse(t *testing.T) {
+	// Validates the fields the manager's wait:false guard checks.
+	// The guard rejects ProvisionCmd != "" && len(Provisions) > 0 when wait: false.
+	dep := deps.Dependency{Name: "ollama", Version: "0.18.1", Type: deps.TypeService}
+
+	userSpec := &config.ServiceSpec{
+		Extra: map[string][]string{
+			"models": {"qwen2.5-coder:7b"},
+		},
+	}
+
+	cfg, err := buildServiceConfig(dep, "run-test", userSpec)
+	require.NoError(t, err)
+
+	// These are the exact conditions the wait:false guard checks
+	assert.NotEmpty(t, cfg.ProvisionCmd, "ProvisionCmd must be set for guard to trigger")
+	assert.NotEmpty(t, cfg.Provisions, "Provisions must be set for guard to trigger")
+
+	// Without provisions, the guard should not trigger
+	cfgNoProv, err := buildServiceConfig(dep, "run-test", nil)
+	require.NoError(t, err)
+	assert.NotEmpty(t, cfgNoProv.ProvisionCmd, "ProvisionCmd is set even without user models")
+	assert.Empty(t, cfgNoProv.Provisions, "No provisions when user doesn't specify models")
+}
+
+func TestBuildProvisionCmds(t *testing.T) {
+	cmds := buildProvisionCmds("ollama pull {item}", []string{"qwen2.5-coder:7b", "nomic-embed-text"})
+	assert.Equal(t, []string{"ollama pull qwen2.5-coder:7b", "ollama pull nomic-embed-text"}, cmds)
+}
+
+func TestBuildProvisionCmdsEmpty(t *testing.T) {
+	cmds := buildProvisionCmds("ollama pull {item}", nil)
+	assert.Empty(t, cmds)
+}
+
+func TestGenerateServiceEnvOllama(t *testing.T) {
+	spec, ok := deps.GetSpec("ollama")
+	require.True(t, ok)
+
+	info := container.ServiceInfo{
+		Name:  "ollama",
+		Host:  "ollama",
+		Ports: map[string]int{"default": 11434},
+		Env:   map[string]string{},
+	}
+
+	env := generateServiceEnv(spec.Service, info, nil)
+
+	assert.Equal(t, "ollama", env["MOAT_OLLAMA_HOST"])
+	assert.Equal(t, "11434", env["MOAT_OLLAMA_PORT"])
+	assert.Equal(t, "http://ollama:11434", env["MOAT_OLLAMA_URL"])
+
+	// No auth — should not have password, user, or db
+	_, hasPassword := env["MOAT_OLLAMA_PASSWORD"]
+	assert.False(t, hasPassword, "should not inject password for no-auth services")
+	_, hasUser := env["MOAT_OLLAMA_USER"]
+	assert.False(t, hasUser)
+	_, hasDB := env["MOAT_OLLAMA_DB"]
+	assert.False(t, hasDB)
+}

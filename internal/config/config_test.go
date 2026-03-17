@@ -5,6 +5,10 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 )
 
 func TestLoadConfig(t *testing.T) {
@@ -2277,4 +2281,89 @@ agent: claude-code
 			t.Errorf("Clipboard should be nil when omitted, got %v", *cfg.Clipboard)
 		}
 	})
+}
+
+func TestServiceSpecUnmarshalWithExtra(t *testing.T) {
+	input := `
+env:
+  FOO: bar
+wait: false
+models:
+  - qwen2.5-coder:7b
+  - nomic-embed-text
+`
+	var spec ServiceSpec
+	err := yaml.Unmarshal([]byte(input), &spec)
+	require.NoError(t, err)
+	assert.Equal(t, "bar", spec.Env["FOO"])
+	assert.False(t, spec.ServiceWait())
+	assert.Equal(t, []string{"qwen2.5-coder:7b", "nomic-embed-text"}, spec.Extra["models"])
+}
+
+func TestServiceSpecUnmarshalNoExtra(t *testing.T) {
+	input := `
+env:
+  POSTGRES_DB: myapp
+`
+	var spec ServiceSpec
+	err := yaml.Unmarshal([]byte(input), &spec)
+	require.NoError(t, err)
+	assert.Equal(t, "myapp", spec.Env["POSTGRES_DB"])
+	assert.Empty(t, spec.Extra)
+}
+
+func TestServiceSpecUnmarshalPreservesImage(t *testing.T) {
+	input := `
+image: custom-postgres:17
+env:
+  POSTGRES_DB: myapp
+`
+	var spec ServiceSpec
+	err := yaml.Unmarshal([]byte(input), &spec)
+	require.NoError(t, err)
+	assert.Equal(t, "custom-postgres:17", spec.Image)
+	assert.Equal(t, "myapp", spec.Env["POSTGRES_DB"])
+}
+
+func TestServiceSpecUnmarshalEmptyExtra(t *testing.T) {
+	input := `
+env:
+  FOO: bar
+models: []
+`
+	var spec ServiceSpec
+	err := yaml.Unmarshal([]byte(input), &spec)
+	require.NoError(t, err)
+	assert.Empty(t, spec.Extra["models"])
+}
+
+func TestServiceSpecUnmarshalCapturesScalarKeys(t *testing.T) {
+	input := `
+env:
+  FOO: bar
+typo_key: some_value
+`
+	var spec ServiceSpec
+	err := yaml.Unmarshal([]byte(input), &spec)
+	require.NoError(t, err)
+	// Unknown scalar keys are captured in Extra with nil value
+	assert.Contains(t, spec.Extra, "typo_key")
+	assert.Nil(t, spec.Extra["typo_key"])
+}
+
+func TestServiceSpecUnmarshalMemoryNotLeakedToExtra(t *testing.T) {
+	// memory: is a known ServiceSpec field — it must not leak into Extra.
+	// If it did, buildServiceConfig would reject it as an unknown key when
+	// combined with a provisions-capable service like ollama.
+	input := `
+memory: 2048
+models:
+  - qwen2.5-coder:1.5b
+`
+	var spec ServiceSpec
+	err := yaml.Unmarshal([]byte(input), &spec)
+	require.NoError(t, err)
+	assert.Equal(t, 2048, spec.Memory)
+	assert.NotContains(t, spec.Extra, "memory", "memory must not appear in Extra")
+	assert.Equal(t, []string{"qwen2.5-coder:1.5b"}, spec.Extra["models"])
 }

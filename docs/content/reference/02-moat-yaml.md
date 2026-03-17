@@ -266,6 +266,7 @@ dependencies:
 | `mysql@8` | MySQL 8 | 3306 |
 | `mysql@9` | MySQL 9 | 3306 |
 | `redis@7` | Redis 7 | 6379 |
+| `ollama@0.18.1` | Ollama | 11434 |
 
 Each service injects `MOAT_*` environment variables into the main container. See [Service environment variables](#service-environment-variables) for the full list.
 
@@ -868,9 +869,31 @@ Each key matches a service name from `dependencies:` (e.g., `postgres`, `mysql`,
 |-------|------|---------|-------------|
 | `env` | `map[string]string` | `{}` | Environment variables for the service container. Supports secret references. |
 | `image` | `string` | (auto) | Override default image (Docker runtime only) |
+| `memory` | `integer` | (runtime default) | Memory limit for the service container in MB. Useful for memory-intensive services like Ollama. |
 | `wait` | `boolean` | `true` | Block main container start until service is ready |
 
 Setting `wait: false` starts the main container without waiting for the service health check to pass.
+
+`memory` sets the limit for the service sidecar container, independent of `container.memory` (which limits the main agent container).
+
+### Service-specific lists
+
+Some services accept additional list configuration beyond `env` and `wait`. These keys are defined by the service's registry entry:
+
+| Service | Key | Purpose |
+|---------|-----|---------|
+| `ollama` | `models` | Models to pull during startup |
+
+Example:
+
+```yaml
+services:
+  ollama:
+    memory: 4096  # 4 GB — size to match your largest model
+    models:
+      - qwen2.5-coder:7b
+      - nomic-embed-text
+```
 
 ### Service environment variables
 
@@ -906,6 +929,14 @@ Moat injects `MOAT_*` environment variables into the main container for each ser
 | `MOAT_REDIS_HOST` | Hostname | `redis` |
 | `MOAT_REDIS_PORT` | Port | `6379` |
 | `MOAT_REDIS_PASSWORD` | Auto-generated password | |
+
+#### Ollama
+
+| Variable | Description | Example |
+|----------|-------------|---------|
+| `MOAT_OLLAMA_HOST` | Service hostname | `ollama` |
+| `MOAT_OLLAMA_PORT` | Service port | `11434` |
+| `MOAT_OLLAMA_URL` | Base URL for the Ollama API | `http://ollama:11434` |
 
 ---
 

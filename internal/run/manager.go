@@ -1878,6 +1878,7 @@ region = %s
 		// Start services
 		r.ServiceContainers = make(map[string]string)
 		var serviceInfos []container.ServiceInfo
+		var svcConfigs []container.ServiceConfig
 
 		cleanupServices := func() {
 			for _, info := range serviceInfos {
@@ -1904,6 +1905,21 @@ region = %s
 				return nil, fmt.Errorf("configuring %s service: %w", dep.Name, err)
 			}
 
+			svcConfigs = append(svcConfigs, svcCfg)
+
+			// Create cache directory if needed
+			if svcCfg.CacheHostPath != "" {
+				if mkdirErr := os.MkdirAll(svcCfg.CacheHostPath, 0o700); mkdirErr != nil {
+					cleanupServices()
+					cleanupDaemonRun()
+					cleanupSSH(sshServer)
+					cleanupAgentConfig(claudeConfig)
+					cleanupAgentConfig(codexConfig)
+					cleanupAgentConfig(geminiConfig)
+					return nil, fmt.Errorf("creating cache directory for %s: %w", dep.Name, mkdirErr)
+				}
+			}
+
 			info, err := svcMgr.StartService(ctx, svcCfg)
 			if err != nil {
 				cleanupServices()
@@ -1919,6 +1935,21 @@ region = %s
 			r.ServiceContainers[dep.Name] = info.ID
 		}
 
+		// Create run storage early so provision output can be captured in logs.
+		// NewRunStore is idempotent (uses MkdirAll), so it's safe to call now
+		// even though the main container hasn't been created yet.
+		store, err := storage.NewRunStore(storage.DefaultBaseDir(), r.ID)
+		if err != nil {
+			cleanupServices()
+			cleanupDaemonRun()
+			cleanupSSH(sshServer)
+			cleanupAgentConfig(claudeConfig)
+			cleanupAgentConfig(codexConfig)
+			cleanupAgentConfig(geminiConfig)
+			return nil, fmt.Errorf("creating run storage: %w", err)
+		}
+		r.Store = store
+
 		// Wait for readiness
 		for i, dep := range serviceDeps {
 			wait := true
@@ -1928,10 +1959,25 @@ region = %s
 				}
 			}
 			if !wait {
+				// Reject wait: false when provisions are declared — models can't
+				// be pulled until the service is ready.
+				if svcConfigs[i].ProvisionCmd != "" && len(svcConfigs[i].Provisions) > 0 {
+					cleanupServices()
+					cleanupDaemonRun()
+					cleanupSSH(sshServer)
+					cleanupAgentConfig(claudeConfig)
+					cleanupAgentConfig(codexConfig)
+					cleanupAgentConfig(geminiConfig)
+					return nil, fmt.Errorf("%s: wait: false is incompatible with provisioning — "+
+						"items cannot be pulled until the service is ready\n\n"+
+						"Either remove wait: false or remove the provisioned items",
+						dep.Name)
+				}
 				continue
 			}
 
 			info := serviceInfos[i]
+			fmt.Fprintf(os.Stderr, "Waiting for %s to be ready...\n", dep.Name)
 			log.Debug("waiting for service to be ready", "service", dep.Name)
 			if err := waitForServiceReady(ctx, svcMgr, info); err != nil {
 				cleanupServices()
@@ -1941,9 +1987,38 @@ region = %s
 				cleanupAgentConfig(codexConfig)
 				cleanupAgentConfig(geminiConfig)
 				return nil, fmt.Errorf("%s service failed to become ready: %w\n\n"+
-					"Service container logs:\n  moat logs %s --service %s\n\n"+
+					"Check run logs:\n  moat logs %s\n\n"+
 					"Or disable wait:\n  services:\n    %s:\n      wait: false",
-					dep.Name, err, r.ID, dep.Name, dep.Name)
+					dep.Name, err, r.ID, dep.Name)
+			}
+
+			// Provision items (e.g., pull models) if configured
+			if svcConfigs[i].ProvisionCmd != "" && len(svcConfigs[i].Provisions) > 0 {
+				fmt.Fprintf(os.Stderr, "Pulling %d item(s) for %s: %s\n",
+					len(svcConfigs[i].Provisions), dep.Name, strings.Join(svcConfigs[i].Provisions, ", "))
+				log.Debug("provisioning service", "service", dep.Name, "items", svcConfigs[i].Provisions)
+				// IIFE so defer lw.Close() fires after provisionService, not at function exit.
+				// Without this, multiple provision-capable services would accumulate deferred
+				// closes until the outer function returns.
+				provErr := func() error {
+					provOut := io.Writer(os.Stderr)
+					if lw, lwErr := store.LogWriter(); lwErr == nil {
+						defer lw.Close()
+						provOut = io.MultiWriter(os.Stderr, lw)
+					}
+					return provisionService(ctx, svcMgr, info, svcConfigs[i], provOut)
+				}()
+				if err := provErr; err != nil {
+					cleanupServices()
+					cleanupDaemonRun()
+					cleanupSSH(sshServer)
+					cleanupAgentConfig(claudeConfig)
+					cleanupAgentConfig(codexConfig)
+					cleanupAgentConfig(geminiConfig)
+					return nil, fmt.Errorf("%s service provisioning failed: %w\n\n"+
+						"Check run logs:\n  moat logs %s",
+						dep.Name, err, r.ID)
+				}
 			}
 		}
 
@@ -2112,30 +2187,33 @@ region = %s
 		}
 	}
 
-	// Create run storage
-	store, err := storage.NewRunStore(storage.DefaultBaseDir(), r.ID)
-	if err != nil {
-		// Clean up container and proxy if storage creation fails
-		if rmErr := m.runtime.RemoveContainer(ctx, containerID); rmErr != nil {
-			log.Debug("failed to remove container during cleanup", "error", rmErr)
+	// Ensure run storage exists (may have been created early for service provisioning,
+	// or needs to be created now for runs without services).
+	if r.Store == nil {
+		runStore, storeErr := storage.NewRunStore(storage.DefaultBaseDir(), r.ID)
+		if storeErr != nil {
+			// Clean up container and proxy if storage creation fails
+			if rmErr := m.runtime.RemoveContainer(ctx, containerID); rmErr != nil {
+				log.Debug("failed to remove container during cleanup", "error", rmErr)
+			}
+			cleanupDaemonRun()
+			cleanupAgentConfig(claudeConfig)
+			cleanupAgentConfig(codexConfig)
+			cleanupAgentConfig(geminiConfig)
+			return nil, fmt.Errorf("creating run storage: %w", storeErr)
 		}
-		cleanupDaemonRun()
-		cleanupAgentConfig(claudeConfig)
-		cleanupAgentConfig(codexConfig)
-		cleanupAgentConfig(geminiConfig)
-		return nil, fmt.Errorf("creating run storage: %w", err)
+		r.Store = runStore
 	}
-	r.Store = store
 
 	// Save the generated Dockerfile to the run directory for debugging/inspection
 	if generatedDockerfile != "" {
-		if saveErr := store.SaveDockerfile(generatedDockerfile); saveErr != nil {
+		if saveErr := r.Store.SaveDockerfile(generatedDockerfile); saveErr != nil {
 			log.Debug("failed to save Dockerfile to run directory", "error", saveErr)
 		}
 	}
 
 	// Open audit store for tamper-proof logging
-	auditStore, err := audit.OpenStore(filepath.Join(store.Dir(), "audit.db"))
+	auditStore, err := audit.OpenStore(filepath.Join(r.Store.Dir(), "audit.db"))
 	if err != nil {
 		// Clean up container, proxy, and storage if audit store fails
 		if rmErr := m.runtime.RemoveContainer(ctx, containerID); rmErr != nil {
@@ -2167,7 +2245,7 @@ region = %s
 
 	// Initialize snapshot engine if not disabled
 	if opts.Config != nil && !opts.Config.Snapshots.Disabled {
-		snapshotDir := filepath.Join(store.Dir(), "snapshots")
+		snapshotDir := filepath.Join(r.Store.Dir(), "snapshots")
 		snapEngine, snapErr := snapshot.NewEngine(opts.Workspace, snapshotDir, snapshot.EngineOptions{
 			UseGitignore: !opts.Config.Snapshots.Exclude.IgnoreGitignore,
 			Additional:   opts.Config.Snapshots.Exclude.Additional,
@@ -2187,7 +2265,7 @@ region = %s
 
 	// Log resolved secrets (best-effort; non-fatal if it fails)
 	for _, secret := range resolvedSecrets {
-		_ = store.WriteSecretResolution(storage.SecretResolution{
+		_ = r.Store.WriteSecretResolution(storage.SecretResolution{
 			Timestamp: time.Now().UTC(),
 			Name:      secret.name,
 			Backend:   secret.scheme,
