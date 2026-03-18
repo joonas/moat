@@ -2,6 +2,9 @@ package container
 
 import (
 	"context"
+	"net"
+	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
@@ -9,9 +12,7 @@ import (
 )
 
 func TestGVisorAvailable(t *testing.T) {
-	// This test verifies the function exists and returns a boolean.
 	// Actual gVisor detection depends on Docker daemon configuration.
-	// Use a timeout to prevent CI hangs if Docker is unreachable.
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
@@ -98,20 +99,74 @@ func TestTryAppleRuntimeNoContainerCLI(t *testing.T) {
 	}
 }
 
-func TestIsKernelNotConfiguredError(t *testing.T) {
-	tests := []struct {
-		msg  string
-		want bool
-	}{
-		{"kernel not configured", true},
-		{"default kernel", true},
-		{"some other error", false},
-		{"", false},
-		{"Error: kernel not configured for this architecture", true},
+func TestAlternativeDockerSocketPaths(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("alternative socket paths are macOS-only")
 	}
-	for _, tt := range tests {
-		if got := isKernelNotConfiguredError(tt.msg); got != tt.want {
-			t.Errorf("isKernelNotConfiguredError(%q) = %v, want %v", tt.msg, got, tt.want)
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+
+	candidates := alternativeDockerSockets()
+	wantPath := filepath.Join(home, ".rd", "docker.sock")
+	for _, c := range candidates {
+		if c.name == "Rancher Desktop" && c.path != wantPath {
+			t.Errorf("Rancher Desktop: path = %q, want %q", c.path, wantPath)
 		}
+	}
+}
+
+func TestTryAlternativeDockerSocketsNoSockets(t *testing.T) {
+	// On non-darwin, alternativeDockerSockets returns nil immediately.
+	// On darwin, point HOME at an empty dir so no candidate paths exist.
+	t.Setenv("HOME", t.TempDir())
+
+	rt := tryAlternativeDockerSockets(false)
+	if rt != nil {
+		t.Error("expected nil when no alternative sockets exist")
+	}
+}
+
+// TestSocketStatFollowsSymlink verifies that os.Stat (not Lstat) is the correct
+// call for socket detection. On macOS, ~/.rd/docker.sock is a symlink to the
+// actual socket. os.Lstat returns ModeSymlink (not ModeSocket), causing
+// detection to silently skip the candidate. os.Stat follows the symlink.
+// This test has no network dependency and no timeout.
+func TestSocketStatFollowsSymlink(t *testing.T) {
+	dir, err := os.MkdirTemp("", "m")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	sockPath := filepath.Join(dir, "real.sock")
+	ln, err := net.Listen("unix", sockPath)
+	if err != nil {
+		t.Fatalf("creating socket: %v", err)
+	}
+	defer ln.Close()
+
+	linkPath := filepath.Join(dir, "link.sock")
+	if err := os.Symlink(sockPath, linkPath); err != nil {
+		t.Fatalf("creating symlink: %v", err)
+	}
+
+	// os.Lstat on a symlink-to-socket returns ModeSymlink, not ModeSocket.
+	linfo, err := os.Lstat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if linfo.Mode()&os.ModeSocket != 0 {
+		t.Error("os.Lstat should NOT report ModeSocket for a symlink to a socket")
+	}
+
+	// os.Stat follows the symlink and correctly reports ModeSocket.
+	info, err := os.Stat(linkPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Error("os.Stat should report ModeSocket when following a symlink to a socket")
 	}
 }

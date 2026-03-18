@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
@@ -96,18 +97,33 @@ func NewRuntime() (Runtime, error) {
 }
 
 // newDockerRuntimeWithPing creates a Docker runtime and verifies it's accessible.
+// If the default Docker socket is unreachable and DOCKER_HOST is not set, it
+// probes known alternative socket locations (see tryAlternativeDockerSockets).
+// As a side effect, if an alternative socket is found, DOCKER_HOST is set
+// permanently in the process environment to point to it.
 func newDockerRuntimeWithPing(sandbox bool) (Runtime, error) {
-	rt, err := NewDockerRuntime(sandbox)
+	var rt Runtime
+	dockerRT, err := NewDockerRuntime(sandbox)
 	if err != nil {
 		return nil, fmt.Errorf("Docker runtime error: %w", err)
 	}
+	rt = dockerRT
 
 	// Verify Docker is accessible
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
 	if err := rt.Ping(ctx); err != nil {
-		return nil, err
+		// If DOCKER_HOST is not explicitly set, try known alternative socket
+		// paths from tools like Rancher Desktop.
+		if os.Getenv("DOCKER_HOST") != "" {
+			return nil, err
+		}
+		altRT := tryAlternativeDockerSockets(sandbox)
+		if altRT == nil {
+			return nil, err
+		}
+		rt = altRT
 	}
 
 	runtimeName := "Docker"
@@ -120,6 +136,75 @@ func newDockerRuntimeWithPing(sandbox bool) (Runtime, error) {
 	}
 	log.Debug("using " + runtimeName + " runtime")
 	return rt, nil
+}
+
+// dockerSocketCandidate represents a known Docker-compatible socket from a
+// third-party container tool.
+type dockerSocketCandidate struct {
+	path string
+	name string
+}
+
+// alternativeDockerSockets returns paths to Docker-compatible sockets from
+// third-party tools. Checked when the default Docker socket is unreachable
+// and DOCKER_HOST is not set. The first reachable socket wins.
+//
+// Entries are platform-specific: macOS-only paths are guarded by
+// runtime.GOOS so they are not probed unnecessarily on Linux.
+func alternativeDockerSockets() []dockerSocketCandidate {
+	if runtime.GOOS != "darwin" {
+		return nil
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return nil
+	}
+	return []dockerSocketCandidate{
+		{filepath.Join(home, ".rd", "docker.sock"), "Rancher Desktop"},
+	}
+}
+
+// tryAlternativeDockerSockets checks known Docker-compatible socket paths from
+// third-party container tools when the default Docker socket is unreachable.
+//
+// If a working socket is found, DOCKER_HOST is set so all subsequent Docker
+// client creation uses the discovered socket.
+func tryAlternativeDockerSockets(sandbox bool) Runtime {
+	for _, c := range alternativeDockerSockets() {
+		// Use os.Stat (not Lstat) to follow symlinks — on macOS,
+		// ~/.rd/docker.sock is a symlink to the actual socket.
+		info, err := os.Stat(c.path)
+		if err != nil || info.Mode()&os.ModeSocket == 0 {
+			continue
+		}
+
+		host := "unix://" + c.path
+		log.Debug("trying alternative Docker socket", "path", c.path, "tool", c.name)
+
+		// Set DOCKER_HOST so NewDockerRuntime picks up the socket, then
+		// ping to verify it's reachable before committing to it.
+		os.Setenv("DOCKER_HOST", host)
+
+		rt, err := NewDockerRuntime(sandbox)
+		if err != nil {
+			os.Unsetenv("DOCKER_HOST")
+			continue
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		pingErr := rt.Ping(ctx)
+		cancel()
+		if pingErr != nil {
+			os.Unsetenv("DOCKER_HOST")
+			continue
+		}
+
+		// Socket is reachable — DOCKER_HOST is already set.
+		log.Debug("auto-detected Docker via "+c.name, "socket", c.path)
+		return rt
+	}
+
+	return nil
 }
 
 // tryAppleRuntime attempts to create and verify an Apple runtime.
