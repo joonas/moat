@@ -40,6 +40,7 @@ import (
 	"github.com/majorcontext/moat/internal/provider"
 	awsprov "github.com/majorcontext/moat/internal/providers/aws"
 	"github.com/majorcontext/moat/internal/providers/claude" // only for settings types (LoadAllSettings, Settings, MarketplaceConfig) - provider setup uses provider interfaces
+	copilotprov "github.com/majorcontext/moat/internal/providers/copilot"
 	"github.com/majorcontext/moat/internal/runctx"
 	"github.com/majorcontext/moat/internal/secrets"
 	"github.com/majorcontext/moat/internal/snapshot"
@@ -106,6 +107,11 @@ func (m *Manager) Create(ctx context.Context, opts Options) (resRun *Run, retErr
 		}
 	}
 
+	opts.Grants = normalizeCopilotGrantNames(opts.Grants)
+	if opts.Config != nil {
+		opts.Config.Grants = normalizeCopilotGrantNames(opts.Config.Grants)
+	}
+
 	// Auto-include MCP auth grants so the credential processing loop loads
 	// them into the RunContext. Without this, users would need to duplicate
 	// each mcp[].auth.grant in the top-level grants: list.
@@ -138,7 +144,7 @@ func (m *Manager) Create(ctx context.Context, opts Options) (resRun *Run, retErr
 	}
 
 	// Validate grants before allocating any resources (proxy, container, etc.)
-	needsGrantValidation := len(opts.Grants) > 0 || (opts.Config != nil && len(opts.Config.MCP) > 0)
+	needsGrantValidation := len(opts.Grants) > 0 || (opts.Config != nil && len(opts.Config.MCP) > 0) || configUsesCopilotCLI(opts.Config)
 	if needsGrantValidation {
 		store, err := openCredStore()
 		if err != nil {
@@ -151,6 +157,9 @@ func (m *Manager) Create(ctx context.Context, opts Options) (resRun *Run, retErr
 			if err := validateMCPGrants(opts.Config, store); err != nil {
 				return nil, err
 			}
+		}
+		if err := validateCopilotGitHubGrant(ctx, opts.Config, opts.Grants, store); err != nil {
+			return nil, err
 		}
 	}
 
@@ -400,6 +409,7 @@ func (m *Manager) Create(ctx context.Context, opts Options) (resRun *Run, retErr
 		// Create a RunContext that implements credential.ProxyConfigurer.
 		// Providers will configure their credentials on this context.
 		runCtx := daemon.NewRunContext(r.ID)
+		runCtx.CopilotGitHubAuth = configUsesCopilotCLI(opts.Config) && hasGrant(opts.Grants, "github")
 
 		// Load credentials for granted providers
 		store, err := openCredStore()
@@ -458,6 +468,14 @@ func (m *Manager) Create(ctx context.Context, opts Options) (resRun *Run, retErr
 				}
 				// Configure the RunContext (which implements ProxyConfigurer)
 				prov.ConfigureProxy(runCtx, provCred)
+				if grantName == "github" && runCtx.CopilotGitHubAuth {
+					copilotProv := provider.Get("copilot")
+					if copilotProv == nil {
+						cleanupDaemonRun()
+						return nil, fmt.Errorf("copilot provider not registered")
+					}
+					copilotProv.ConfigureProxy(runCtx, provCred)
+				}
 				envVars := prov.ContainerEnv(provCred)
 				log.Debug("adding provider env vars", "provider", credName, "vars", envVars)
 				providerEnv = append(providerEnv, envVars...)
@@ -1126,6 +1144,9 @@ region = %s
 	imgNeeds := resolveImageNeeds(opts.Grants, depList)
 	needsClaudeInit := slices.Contains(imgNeeds.initProviders, "claude")
 	needsCodexInit := slices.Contains(imgNeeds.initProviders, "codex")
+	// Copilot uses the github grant, so grant-based image analysis cannot
+	// distinguish a Copilot run from a generic GitHub-authenticated run.
+	needsCopilotInit := slices.Contains(imgNeeds.initProviders, "copilot") || (opts.Config != nil && strings.HasPrefix(opts.Config.Agent, "copilot"))
 	needsGeminiInit := slices.Contains(imgNeeds.initProviders, "gemini")
 	needsPiInit := slices.Contains(imgNeeds.initProviders, "pi")
 
@@ -1417,6 +1438,35 @@ region = %s
 		proxyEnv = append(proxyEnv, codexConfig.Env...)
 	}
 
+	// Set up GitHub Copilot CLI staging directory using the provider interface.
+	var copilotConfig *provider.ContainerConfig
+	if needsCopilotInit {
+		copilotProvider := provider.GetAgent("copilot")
+		if copilotProvider == nil {
+			cleanupDaemonRun()
+			cleanupAgentConfig(claudeConfig)
+			cleanupAgentConfig(codexConfig)
+			return nil, fmt.Errorf("copilot provider not registered")
+		}
+
+		cfg, stageErr := m.setupCopilotStaging(ctx, copilotProvider, containerHome, renderedContext, openCredStore)
+		if stageErr != nil {
+			cleanupDaemonRun()
+			cleanupSSH(sshServer)
+			cleanupAgentConfig(claudeConfig)
+			cleanupAgentConfig(codexConfig)
+			return nil, stageErr
+		}
+		copilotConfig = cfg
+		mounts = append(mounts, copilotConfig.Mounts...)
+		proxyEnv = append(proxyEnv, copilotConfig.Env...)
+		defer func() {
+			if retErr != nil {
+				cleanupAgentConfig(copilotConfig)
+			}
+		}()
+	}
+
 	// Set up Gemini staging directory for init script using the provider interface.
 	// This includes settings.json and optionally oauth_creds.json.
 	var geminiConfig *provider.ContainerConfig
@@ -1427,6 +1477,7 @@ region = %s
 			cleanupDaemonRun()
 			cleanupAgentConfig(claudeConfig)
 			cleanupAgentConfig(codexConfig)
+			cleanupAgentConfig(copilotConfig)
 			return nil, fmt.Errorf("gemini provider not registered")
 		}
 
@@ -1436,6 +1487,7 @@ region = %s
 			cleanupSSH(sshServer)
 			cleanupAgentConfig(claudeConfig)
 			cleanupAgentConfig(codexConfig)
+			cleanupAgentConfig(copilotConfig)
 			return nil, stageErr
 		}
 		geminiConfig = cfg
@@ -1454,6 +1506,7 @@ region = %s
 			cleanupSSH(sshServer)
 			cleanupAgentConfig(claudeConfig)
 			cleanupAgentConfig(codexConfig)
+			cleanupAgentConfig(copilotConfig)
 			cleanupAgentConfig(geminiConfig)
 			return nil, fmt.Errorf("pi provider not registered")
 		}
@@ -1464,6 +1517,7 @@ region = %s
 			cleanupSSH(sshServer)
 			cleanupAgentConfig(claudeConfig)
 			cleanupAgentConfig(codexConfig)
+			cleanupAgentConfig(copilotConfig)
 			cleanupAgentConfig(geminiConfig)
 			return nil, stageErr
 		}
@@ -1546,6 +1600,7 @@ region = %s
 			cleanupSSH(sshServer)
 			cleanupAgentConfig(claudeConfig)
 			cleanupAgentConfig(codexConfig)
+			cleanupAgentConfig(copilotConfig)
 			return nil, fmt.Errorf("BuildKit requires Docker runtime (networks not supported by %s)", m.defaultRuntime().Type())
 		}
 		netID, netErr := netMgr.CreateNetwork(ctx, buildkitCfg.NetworkName)
@@ -1554,6 +1609,7 @@ region = %s
 			cleanupSSH(sshServer)
 			cleanupAgentConfig(claudeConfig)
 			cleanupAgentConfig(codexConfig)
+			cleanupAgentConfig(copilotConfig)
 			return nil, fmt.Errorf("failed to create Docker network for buildkit sidecar: %w", netErr)
 		}
 		networkID = netID
@@ -2003,6 +2059,7 @@ region = %s
 		cleanupAgentConfig(claudeConfig)
 		cleanupAgentConfig(codexConfig)
 		cleanupAgentConfig(geminiConfig)
+		cleanupAgentConfig(copilotConfig)
 		return nil, fmt.Errorf("creating container: %w", err)
 	}
 
@@ -2024,6 +2081,9 @@ region = %s
 	}
 	if geminiConfig != nil {
 		r.GeminiConfigTempDir = geminiConfig.StagingDir
+	}
+	if copilotConfig != nil {
+		r.CopilotConfigTempDir = copilotConfig.StagingDir
 	}
 	if piConfig != nil {
 		r.PiConfigTempDir = piConfig.StagingDir
@@ -2181,7 +2241,7 @@ func replaceHostInEnv(env []string, oldHost, newHost string) []string {
 }
 
 // isAIAgent returns true if the config specifies an AI coding agent
-// (claude, codex, or gemini). Used to apply agent-specific defaults
+// (claude, codex, copilot, gemini, or pi). Used to apply agent-specific defaults
 // like the 8 GB memory limit on Apple containers.
 func isAIAgent(cfg *config.Config) bool {
 	if cfg == nil {
@@ -2189,8 +2249,74 @@ func isAIAgent(cfg *config.Config) bool {
 	}
 	return strings.HasPrefix(cfg.Agent, "claude") ||
 		strings.HasPrefix(cfg.Agent, "codex") ||
+		strings.HasPrefix(cfg.Agent, "copilot") ||
 		strings.HasPrefix(cfg.Agent, "gemini") ||
 		strings.HasPrefix(cfg.Agent, "pi")
+}
+
+func configUsesCopilotCLI(cfg *config.Config) bool {
+	if cfg == nil {
+		return false
+	}
+	if strings.HasPrefix(cfg.Agent, "copilot") {
+		return true
+	}
+	for _, dep := range cfg.Dependencies {
+		name := dep
+		if i := strings.IndexByte(dep, '@'); i >= 0 {
+			name = dep[:i]
+		}
+		if name == "copilot-cli" {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeCopilotGrantNames(grants []string) []string {
+	if len(grants) == 0 {
+		return grants
+	}
+	out := make([]string, 0, len(grants))
+	hasGitHub := false
+	for _, grant := range grants {
+		if strings.Split(grant, ":")[0] == "github" {
+			if hasGitHub {
+				continue
+			}
+			hasGitHub = true
+			out = append(out, grant)
+			continue
+		}
+		if strings.Split(grant, ":")[0] == "copilot" {
+			if !hasGitHub {
+				out = append(out, "github")
+				hasGitHub = true
+			}
+			continue
+		}
+		out = append(out, grant)
+	}
+	return out
+}
+
+var validateCopilotGitHubToken = copilotprov.ValidateGitHubToken
+
+func validateCopilotGitHubGrant(ctx context.Context, cfg *config.Config, grants []string, store credential.Store) error {
+	if !configUsesCopilotCLI(cfg) {
+		return nil
+	}
+	if !hasGrant(grants, "github") {
+		return fmt.Errorf("GitHub Copilot CLI requires the github grant\n\nRun: moat grant github")
+	}
+	cred, err := store.Get(credential.ProviderGitHub)
+	if err != nil {
+		return fmt.Errorf("github grant: credential not found: %w", err)
+	}
+	if err := validateCopilotGitHubToken(ctx, cred.Token); err != nil {
+		return fmt.Errorf("github grant cannot use GitHub Copilot: %w\n\nRun: moat grant github with a GitHub CLI OAuth token from an account with Copilot access, or a fine-grained PAT with the Copilot Requests permission", err)
+	}
+	return nil
 }
 
 // resolveContainerHome returns the home directory to use for container mounts.
@@ -2464,17 +2590,18 @@ func isMoatOwnedProxyVar(name string) bool {
 // suitable for sending to the daemon API.
 func buildRegisterRequest(rc *daemon.RunContext, grants []string) daemon.RegisterRequest {
 	req := daemon.RegisterRequest{
-		RunID:            rc.RunID,
-		NetworkPolicy:    rc.NetworkPolicy,
-		NetworkAllow:     rc.NetworkAllow,
-		NetworkRules:     rc.NetworkRules,
-		HostGateway:      rc.HostGateway,
-		HostGatewayIP:    rc.HostGatewayIP,
-		AllowedHostPorts: rc.AllowedHostPorts,
-		MCPServers:       rc.MCPServers,
-		Grants:           grants,
-		AWSConfig:        rc.AWSConfig,
-		CredProfile:      credential.ActiveProfile,
+		RunID:             rc.RunID,
+		NetworkPolicy:     rc.NetworkPolicy,
+		NetworkAllow:      rc.NetworkAllow,
+		NetworkRules:      rc.NetworkRules,
+		HostGateway:       rc.HostGateway,
+		HostGatewayIP:     rc.HostGatewayIP,
+		AllowedHostPorts:  rc.AllowedHostPorts,
+		MCPServers:        rc.MCPServers,
+		Grants:            grants,
+		CopilotGitHubAuth: rc.CopilotGitHubAuth,
+		AWSConfig:         rc.AWSConfig,
+		CredProfile:       credential.ActiveProfile,
 	}
 
 	for host, creds := range rc.Credentials {

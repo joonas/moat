@@ -134,6 +134,11 @@ type Run struct {
 	// cleaned up when the run is stopped or destroyed.
 	GeminiConfigTempDir string
 
+	// CopilotConfigTempDir is the temporary directory containing Copilot configuration files
+	// and runtime context that are mounted into the container. This should be
+	// cleaned up when the run is stopped or destroyed.
+	CopilotConfigTempDir string
+
 	// PiConfigTempDir is the temporary directory containing Pi configuration files
 	// (the runtime-context file) that are mounted into the container. This should be
 	// cleaned up when the run is stopped or destroyed.
@@ -340,6 +345,9 @@ func validateGrants(grants []string, store *credential.FileStore) error {
 func grantToCommand(grant string) string {
 	if server, ok := mcpcatalog.GrantName(grant); ok {
 		return "mcp " + server
+	}
+	if grant == "copilot" {
+		return "github"
 	}
 	if parts := strings.SplitN(grant, ":", 2); len(parts) == 2 {
 		return parts[0] + " " + parts[1]

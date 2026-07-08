@@ -56,7 +56,9 @@ func RegisterDynamicProvider(p Provider) {
 // KnownProviders returns a list of all known credential providers.
 func KnownProviders() []Provider {
 	base := []Provider{ProviderGitHub, ProviderAWS, ProviderAnthropic, ProviderClaude, ProviderOpenAI, ProviderGemini, ProviderNpm, ProviderGraphite, ProviderMeta}
-	return append(base, dynamicProviders...)
+	known := make([]Provider, 0, len(base)+len(dynamicProviders))
+	known = append(known, base...)
+	return append(known, dynamicProviders...)
 }
 
 // IsKnownProvider returns true if the provider is a known credential provider.

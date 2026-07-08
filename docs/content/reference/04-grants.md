@@ -48,8 +48,8 @@ No flags. The command automatically detects your credential source.
 
 ### Credential sources (in order of preference)
 
-1. **gh CLI** -- Uses the token from `gh auth token` if the GitHub CLI is installed and authenticated
-2. **Environment variable** -- Falls back to `GITHUB_TOKEN` or `GH_TOKEN` if set
+1. **Environment variable** -- Uses `GITHUB_TOKEN` or `GH_TOKEN` if set
+2. **gh CLI** -- Uses the token from `gh auth token` if the GitHub CLI is installed and authenticated
 3. **Personal Access Token** -- Interactive prompt for manual PAT entry
 
 ### What it injects
@@ -63,9 +63,13 @@ The proxy injects an `Authorization` header, using the scheme each host expects:
 
 The container receives `GH_TOKEN` set to a format-valid placeholder so the gh CLI works without prompting. Git is configured with `http.proxyAuthMethod=basic` so it authenticates to the proxy and can establish the HTTPS tunnel.
 
+For `moat copilot` runs, the same GitHub grant is also injected for Copilot API hosts, and the container receives a format-valid `COPILOT_GITHUB_TOKEN` placeholder. The GitHub token must be Copilot-capable: use a GitHub CLI OAuth token from an account with Copilot access, or a fine-grained PAT from your personal account with the **Copilot Requests** account permission.
+
+Moat validates Copilot access before starting a Copilot run by calling `api.github.com/copilot_internal/user` with the stored GitHub credential.
+
 ### Refresh behavior
 
-Tokens sourced from `gh auth token` or environment variables are refreshed every 30 minutes. PATs entered manually are static.
+Tokens sourced from `gh auth token` are refreshed every 30 minutes. Environment variables and PATs entered manually are static.
 
 ### moat.yaml
 
@@ -87,6 +91,34 @@ GitHub credential saved
 
 $ moat run --grant github ./my-project
 ```
+
+## GitHub Copilot
+
+GitHub Copilot CLI uses the `github` grant. There is no separate Copilot credential to configure.
+
+```bash
+moat grant github
+```
+
+Classic PATs are not supported by GitHub Copilot CLI. Fine-grained PATs must be created for your personal account, not an organization, and need the **Copilot Requests** account permission.
+
+### What it injects
+
+For Copilot runs, the proxy injects the GitHub token for:
+
+- `api.github.com` and Copilot API hosts -- Copilot CLI authentication, model traffic, and GitHub API calls
+- `github.com` -- HTTPS git operations
+
+The container receives `COPILOT_GITHUB_TOKEN` and `GH_TOKEN` placeholders. Copilot CLI and gh CLI authenticate normally, but the raw token stays on the host.
+
+### moat.yaml
+
+```yaml
+grants:
+  - github
+```
+
+Use this grant with `moat copilot`; the command adds it automatically.
 
 ## Anthropic / Claude
 

@@ -100,6 +100,9 @@ func resolveImageNeedsWithStore(grants []string, depList []deps.Dependency, stor
 	if !initSet["claude"] && hasDep(depList, "claude-code") {
 		initSet["claude"] = true
 	}
+	if !initSet["copilot"] && hasDep(depList, "copilot-cli") {
+		initSet["copilot"] = true
+	}
 	if !initSet["gemini"] && hasDep(depList, "gemini-cli") {
 		initSet["gemini"] = true
 	}
@@ -135,6 +138,9 @@ func credentialStoreKey(baseName, fullGrant string) credential.Provider {
 	canonical := provider.ResolveName(baseName)
 	if canonical == providerCodex {
 		return credential.ProviderOpenAI
+	}
+	if canonical == "copilot" {
+		return credential.ProviderGitHub
 	}
 	// OAuth uses the full grant name as store key (oauth:notion → "oauth:notion")
 	// so each integration has its own credential entry.
